@@ -21,6 +21,8 @@ contract StableSwap3Pool {
         address indexed buyer, int128 sold_id, uint256 tokens_sold, int128 bought_id, uint256 tokens_bought
     );
 
+    event AddLiquidity(address indexed provider,uint256[3] token_amounts, uint256[3] fees, uint256 invariant, uint256 token_supply);
+
     /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
     /*                         ERRORS                             */
     /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
@@ -253,25 +255,214 @@ contract StableSwap3Pool {
 
             address in_coin = coins[i];
 
+            // Take coins from Sender
             if(in_amount>0){
+
                 if(i==FEE_INDEX){
                     in_amount = IERC20(in_coin).balanceOf(address(this));
                 }
+
+                bool success = IERC20(in_coin).transferFrom(msg.sender,address(this),in_amount);
+                require(success,"Transfer Failed");
+
+                if(i==FEE_INDEX){
+                    in_amount = IERC20(in_coin).balanceOf(address(this)) - in_amount;
+                }
             }
+            new_balances[i] += in_amount;
             unchecked {
                 ++i;
             }
         }
+
+        // INVARIANT AFTER CHANGE
+        uint256 D1 = get_D_mem(new_balances,amp);
+        require(D1>D0);
+
+        // We need to recalculate the invariant accounting for fees
+        // to calculate fair user's share
+
+        uint256 D2 = D1;
+
+        if token_supply>0 {
+            // Only account for fees if we are not the first to deposit
+            for(uint256 i; i<3;){
+                uint256 ideal_balance = ( D1 * old_balances[i]) / D0;
+                uint256 difference = 0;
+
+                if(ideal_balance>new_balances[i]){
+                    difference = ideal_balance - new_balances[i];
+                }
+                else{
+                    difference = new_balances[i] - ideal_balance;
+                }
+                fees[i] = (_fee * difference ) / FEE_DENOMINATOR;
+                balances[i] = new_balances[i] - ( (fees[i]*_admin_fee) / FEE_DENOMINATOR );
+                new_balances[i] -= fees[i];
+                unchecked{
+                    ++i;
+                }
+            }
+
+            D2 = get_D_mem(new_balances, amp);
+        }
+        else{
+            balances = new_balances;
+        }
+
+        // Calculate how much pool tokens to mint
+        uint256 mint_amount = 0;
+        if(token_supply==0){
+            // Take the dust if any? wtf does this mean
+            mint_amount = D1;
+        }
+        else{
+            mint_amount = token_supply* (D2-D0) / D0;
+        }
+
+        require(mint_amount >= min_mint_amount, "Slippage screwed you");
+
+        // Mint pool tokens
+        IERC20(token).mint(msg.sender,mint_amount);
+
+        emit AddLiquidity(msg.sender,amounts,fees,D1,token_supply + mint_amount);
+
+    }
+
+    function get_y(int128 i, int128 j,uint256 x, uint256[3] memory xp_) internal view returns(uint256){
+
+        // x in the input is converted to the same price/precision
+        require(i!=j , " same coin");
+        require(j>=0, " j beelow zero");
+        require(j< 3, " huh ");
+
+        // should be unreachable, but good for safety
+        require(i>=0);
+        require(i<3);
+
+        uint256 amp = _A();
+        uint256 D = get_D(xp_,amp);
+        uint256 c = D;
+        uint256 S_ = 0;
+        uint256 Ann = amp * 3;
+
+        uint256 _x = 0;
+        for(uint256 _i;_i<3;){
+            if _i == i {
+            _x = x
+            }
+            else if( _i != j){
+                _x = xp_[_i];
+            }
+            S_ += _x ;
+            c = c * D / (_x * 3);
+            unchecked{
+                ++_i;
+            }
+        }
+
+        c = c*D / (ANN * 3 );
+
+        uint256 b = (S_ + D) / Ann;
+
+        uint256 y_prev = 0;
+        uint256 y = D;
+
+        for(uint k;k<255;){
+
+            y_prev = y;
+            y = (y*y+c) / (2*y + b - D);
+
+            // Equality with the precision of 1
+
+            if y > y_prev {
+                if( y - y_prev <=1){
+                    break;
+                }
+            }
+            else{
+                if( y_prev - y <=1 ){
+                    break;
+                }
+            }
+            unchecked{
+                ++k;
+            }
+        }
+        return y;
     }
 
 
+    function get_dy(int128 i, int128 j, uint256 dx) returns(uint256){
+        // dx and dy in c-units
+        uint256[3] rates = RATES;
+        uint256[3] xp = _xp();
 
+        uint256 x = xp[i] + (dx * rates[i] / PRECISION) ;
+        uint256 y = get_y(i, j, x, xp);
+        uint256 dy = (xp[j] - y - 1) * PRECISION / rates[j];
+        uint256 _fee = fee * dy / FEE_DENOMINATOR;
 
+        return dy - _fee ;
+    }
 
+    function get_dy_underlying(int128 i, int128 j, uint256 dx) returns(uint256){
+        uint256[3] xp = _xp();
+        uint256[3] precisions = PRECISION_MUL;
 
+        uint256 x = xp[i] + dx * precisions[i];
+        uint256 y = get_y(i, j, x, xp);
+        uint256 dy = (xp[j] - y - 1) / precisions[j];
+        uint256 _fee = fee * dy / FEE_DENOMINATOR;
 
+        return dy - _fee;
+    }
 
+    function exchange(int128 i,int128 j, uint256 dx, uint256 min_dy)external nonReentrant{
+        require(!is_killed);
 
+        uint256[3] rates = RATES;
+
+        uint256[3] old_balances = balances;
+        uint256[3] xp = _xp_mem(old_balances);
+
+        // Handling an unexpected charge of a fee on transfer (USDT, PAXG)
+        uint256 dx_w_fee = dx;
+        address input_coin = coins[i];
+
+        if(i==FEE_INDEX){
+            dx_w_fee = IERC20(input_coin).balanceOf(address(this));
+        }
+
+        bool success_x = IERC20(input_coin).transferFrom(msg.sender,address(this),dx);
+        require(success_x,"Transfer Failed");
+
+        if(i==FEE_INDEX){
+            dx_w_fee = IERC20(input_coin).balanceOf(address(this)) - dx_w_fee;
+        }
+
+        uint256 x = xp[i] + dx_w_fee * rates[i] / PRECISION ;
+        uint256 y = get_y(i, j, x, xp);
+
+        uint256 dy =  xp[j] - y - 1 // -1 just in case there were some rounding errors
+        uint256 dy_fee = dy * fee / FEE_DENOMINATOR;
+
+        // Convert all to real units
+        dy = (dy - dy_fee) * PRECISION / rates[j] ;
+        require( dy >= min_dy, "Exchange resulted in fewer coins than expected");
+
+        uint256 dy_admin_fee = dy_fee * admin_fee / FEE_DENOMINATOR;
+        dy_admin_fee = dy_admin_fee * PRECISION / rates[j] ;
+
+        // Change balances exactly in same way as we change actual ERC20 coin amounts
+        balances[i] = old_balances[i] + dx_w_fee;
+        balances[j] =  old_balances[j] - dy - dy_admin_fee;
+
+        bool success_y = IERC20(coins[j]).transfer(msg.sender,dy);
+        require(success_y,"Transfer Failed");
+
+        emit TokenExchange(msg.sender,i,dx,j,dy);
+    }
 
 
 
