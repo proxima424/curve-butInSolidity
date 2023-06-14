@@ -27,6 +27,20 @@ contract StableSwap3Pool {
 
     event RemoveLiquidityOne(address indexed provider, uint256 token_amount, uint256 coin_amount);
 
+    event RemoveLiquidity(address indexed provider, uint256[3] token_amounts, uint256[3] fees, uint256 token_supply);
+
+    event CommitNewAdmin(uint256 indexed deadline, address indexed admin);
+
+    event NewAdmin(address indexed admin);
+
+    event CommitNewFee(uint256 indexed deadline, uint256 fee, uint256 admin_fee);
+
+    event NewFee(uint256 fee, uint256 admin_fee);
+
+    event RampA(uint256 old_A, uint256 new_A, uint256 initial_time, uint256 future_time);
+
+    event StopRampA(uint256 A, uint256 t);
+
     /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/
     /*                         ERRORS                             */
     /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/
